@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Account
+from app.models import Account, Transaction, PortfolioItem
 from app.schemas import AccountCreate, AccountResponse
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -10,16 +11,26 @@ router = APIRouter(prefix="/accounts", tags=["accounts"])
 
 @router.post("/", response_model=AccountResponse)
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
-    # BUG 1: No duplicate email check - allows creating multiple accounts
-    # with the same email, which will crash on the DB unique constraint
-    # instead of returning a friendly error.
+    existing = db.query(Account).filter(Account.email == account.email).first()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists.",
+        )
     db_account = Account(
         owner_name=account.owner_name,
         email=account.email,
         balance=account.balance,
     )
     db.add(db_account)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists.",
+        )
     db.refresh(db_account)
     return db_account
 
@@ -42,9 +53,8 @@ def delete_account(account_id: int, db: Session = Depends(get_db)):
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
-    # BUG 2: Deleting an account without checking for or cascading
-    # linked transactions/portfolio items. This will cause a foreign key
-    # constraint error if the account has any related records.
+    db.query(Transaction).filter(Transaction.account_id == account_id).delete()
+    db.query(PortfolioItem).filter(PortfolioItem.account_id == account_id).delete()
     db.delete(account)
     db.commit()
     return {"message": "Account deleted"}
